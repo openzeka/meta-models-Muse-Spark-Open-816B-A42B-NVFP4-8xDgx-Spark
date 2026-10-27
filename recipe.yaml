@@ -1,0 +1,101 @@
+# muse-816b-dflash2c.yaml — VERIFIED stable configuration (2026-10-23)
+# Target: meta-models/Muse-Spark-Open-816B-A42B-NVFP4 (816B MoE, NVFP4 W4A4)
+# Draft : nvidia/Muse-Spark-Open-816B-A42B-DFlash2 (NVIDIA-trained, PUBLIC)
+#   Note: the Inferact/DSpark draft LOOPS on long contexts — don't use it (TUTORIAL §11-a).
+# Spec  : k=4 (slot acceptance curve 0.7/0.5/0.39/0.29 → slots 5-8 are dead weight; §8)
+# KV    : auto is CRITICAL (fp8 runs uncalibrated — the checkpoint ships NO attention scales)
+# Attn  : TRITON_ATTN is CRITICAL (flash-attn v2 can't replay varlen cudagraphs)
+recipe_version: "2"
+model: meta-models/Muse-Spark-Open-816B-A42B-NVFP4
+runtime: vllm-distributed
+container: muse-spark-open-dflash2:latest
+
+min_nodes: 8
+max_nodes: 8
+
+metadata:
+  description: |
+    Muse-Spark-Open-816B-A42B (NVFP4 W4A4) on 8x DGX Spark (TP8, multi-node over CX7).
+    Adapted from Meta's vLLM Muse Spark recipe (recipes.vllm.ai) to GB10/sm12x quirks:
+    DeepGEMM off (fp8/GEMM scale-factor workaround) + 5 small patches (see Dockerfile).
+  model_params: 816B
+  model_dtype: nvfp4
+  kv_dtype: auto
+  # Real measured footprint is 8 x 81 GiB; sparkrun underestimates with bare NVFP4 math.
+  model_vram: 648
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 8
+  pipeline_parallel: 1
+  block_size: 16
+  max_model_len: 131000
+  # 8 is a safe decode-memory ceiling on GB10; raise to 16/32 later if you need throughput.
+  max_num_seqs: 8
+  max_num_batched_tokens: 8192
+  # bf16 KV: the NVFP4 export has zero k/v/q/prob scales, so fp8 KV would run
+  # uncalibrated (unity scales) and degrade long generations into repetition.
+  kv_cache_dtype: auto
+  # 0.85 is at the edge of the unified 121 GB pool (weights ~81 + peak activation ~15
+  # + graphs ~4 GiB). If earlyoom SIGTERMs you, drop to 0.78.
+  gpu_memory_utilization: 0.85
+  load_format: auto
+
+env:
+  # DeepGEMM is broken for fp8 GEMM on SM12x — keep it off.
+  VLLM_USE_DEEP_GEMM: '0'
+  VLLM_MOE_USE_DEEP_GEMM: '0'
+  VLLM_USE_V2_MODEL_RUNNER: '1'
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  CUTE_DSL_ARCH: sm_121a
+  # '0' = Python API server: the Rust frontend silently ignores 'enable_auto_tool_choice'
+  # and 'structured_outputs_config', so tool-calls/structured outputs wouldn't work.
+  # Set '1' only for perf experiments where you don't need those.
+  VLLM_USE_RUST_FRONTEND: '0'
+
+  # === JIT-storm throttling (MANDATORY — see TUTORIAL §10-b) ===
+  # sm_121 lacks many prebuilt kernels; first use JIT-compiles them. 20+ parallel
+  # nvcc/cc1plus/triton procs + ~18 GB /dev/shm blow past the 121 GB unified pool and
+  # the machine wedges. These limits keep compile parallelism at 2-ish.
+  MAX_JOBS: '2'
+  FLASHINFER_NVCC_THREADS: '1'
+  OMP_NUM_THREADS: '1'
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_CUDA_ARCH_LIST: 12.1a
+  FLASHINFER_DISABLE_VERSION_CHECK: '1'
+  VLLM_DEEP_GEMM_WARMUP: 'skip'
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_KZ_TRIM_AFTER_LOAD: '1'
+  VLLM_RPC_TIMEOUT: '1800000'
+  VLLM_ENGINE_READY_TIMEOUT_S: '3600'
+  # NCCL CUMEM/buffers also eat the unified pool — cap them.
+  NCCL_CUMEM_ENABLE: '0'
+  NCCL_BUFFSIZE: '1048576'
+  NCCL_MAX_NCHANNELS: '4'
+  NCCL_MIN_NCHANNELS: '4'
+  NCCL_IGNORE_CPU_AFFINITY: '1'
+  TORCH_NCCL_ASYNC_ERROR_HANDLING: '1'
+
+command: |
+  vllm serve {model} \
+    --host {host} \
+    --port {port} \
+    --tensor-parallel-size {tensor_parallel} \
+    --pipeline-parallel-size {pipeline_parallel} \
+    --max-model-len {max_model_len} \
+    --max-num-seqs {max_num_seqs} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --kv-cache-dtype {kv_cache_dtype} \
+    --attention-backend TRITON_ATTN \
+    --block-size {block_size} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --load-format {load_format} \
+    --enable-prefix-caching \
+    --enable-chunked-prefill \
+    --reasoning-parser muse \
+    --tool-call-parser muse \
+    --enable-auto-tool-choice \
+    --served-model-name {model} \
+    --speculative-config '{"method":"dflash","model":"nvidia/Muse-Spark-Open-816B-A42B-DFlash2","num_speculative_tokens":4}' \
+    --moe-backend flashinfer_cutlass
